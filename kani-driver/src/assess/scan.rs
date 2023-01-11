@@ -93,7 +93,6 @@ pub(crate) fn assess_scan_main(session: KaniSession, args: &ScanArgs) -> Result<
             }
             let package_start_time = Instant::now();
             let name = &package.name;
-            let manifest = package.manifest_path.as_std_path();
 
             // We could reasonably choose to write these under 'target/kani', but can't because that gets deleted when 'cargo kani' runs.
             // We could reasonably choose to write these under 'target', but the present way I experiment with 'assess'
@@ -105,7 +104,7 @@ pub(crate) fn assess_scan_main(session: KaniSession, args: &ScanArgs) -> Result<
             let result = if args.existing_only {
                 Ok(())
             } else {
-                invoke_assess(&session, name, manifest, &outfile, &logfile)
+                invoke_assess(&session, package, &outfile, &logfile)
             };
 
             let meta = read_metadata(&outfile);
@@ -161,12 +160,10 @@ pub(crate) fn assess_scan_main(session: KaniSession, args: &ScanArgs) -> Result<
 /// Calls `cargo kani assess` on a single package.
 fn invoke_assess(
     session: &KaniSession,
-    package: &str,
-    manifest: &Path,
+    package: &cargo_metadata::Package,
     outfile: &Path,
     logfile: &Path,
 ) -> Result<()> {
-    let dir = manifest.parent().expect("file not in a directory?");
     let log = std::fs::File::create(logfile)?;
     let mut cmd = Command::new("cargo");
     cmd.arg("kani");
@@ -175,13 +172,15 @@ fn invoke_assess(
     if session.args.only_codegen {
         cmd.arg("--only-codegen");
     }
-    // TODO: -p likewise, probably fixed with a "CargoArgs" refactoring
-    // Additionally, this should be `--manifest-path` but `cargo kani` doesn't support that yet.
-    cmd.arg("-p").arg(package);
+    if session.args.ignore_global_asm {
+        cmd.arg("--ignore-global-asm");
+    }
+    cmd.arg("--manifest-path").arg(&package.manifest_path);
+    // it's necessary to use the package id, not name, to avoid ambiguities:
+    cmd.arg("-p").arg(spec_from_package(package));
     cmd.arg("--enable-unstable"); // This has to be after `-p` due to an argument parsing bug in kani-driver
     cmd.args(&["assess", "--emit-metadata"])
         .arg(outfile)
-        .current_dir(dir)
         .stdout(log.try_clone()?)
         .stderr(log)
         .env("RUST_BACKTRACE", "1");
@@ -235,4 +234,35 @@ fn print_failures(mut failures: Vec<(&Package, Option<AssessMetadata>)>) {
         }
         println!();
     }
+}
+/// Returns a package "spec" suitable for use with `-p`.
+///
+/// A Cargo `pkgid-spec` is documented here:
+/// <https://doc.rust-lang.org/cargo/reference/pkgid-spec.html>
+/// However this documentation is incomplete or out of date.
+/// These specs are not provided by cargo metadata.
+///
+/// A good example, that also motivates our need to use full specs, looks like this:
+///
+/// ```text
+/// error: There are multiple `serde_json` packages in your project, and the specification `serde_json` is ambiguous.
+/// Please re-run this command with `-p <spec>` where `<spec>` is one of the following:
+///   file:///home/ubuntu/top-100-experiment/json#serde_json@1.0.91
+///   https://github.com/rust-lang/crates.io-index#serde_json@1.0.91
+/// ```
+///
+/// This example invites the question, however, of what path should actually be there.
+/// The Cargo.toml? The workspace root? It would seem the former.
+/// A quick grep around the cargo sources shows frequent uses of:
+///
+/// ```text
+/// SourceId::for_path(manifest_path.parent().unwrap())
+/// ```
+///
+/// And so we go with that.
+fn spec_from_package(package: &cargo_metadata::Package) -> String {
+    let path = package.manifest_path.parent().unwrap();
+    let name = &package.name;
+    let version = package.version.to_string();
+    format!("file://{path}#{name}@{version}")
 }
